@@ -1,30 +1,13 @@
----
-output:
-  html_document:
-    theme: cosmo
-    toc: false
-    number_sections: false
----
-
-<style>
-.header {
-  display: flex;
-  align-items: center;
-  gap: 20px;
-  margin-bottom: 30px;
-}
-.header img {
-  height: 72px;
-}
-.header h1 {
-  margin: 0;
-}
-</style>
-
-<div class="header">
-  <img src="img/cihd-logo.png" alt="CIHD logo">
-  <h1>Causal Inference for Health Data (CIHD)</h1>
-</div>
+<table>
+<tr>
+<td width="100">
+  <img src="img/cihd-logo.png" height="80">
+</td>
+<td>
+  <h2>Causal Inference for Health Data (CIHD)</h2>
+</td>
+</tr>
+</table>
 
 This course is organized around a sequence of hands-on vignettes.
 Each vignette illustrates a *distinct causal concept*, using realistic
@@ -33,7 +16,7 @@ assumptions, and interpretation**, rather than black-box modeling.
 
 ---
 
-## Vignette Overview
+### Vignette Overview
 
 | # | Title | Core question | Data used |
 |---|------|---------------|-----------|
