@@ -1,0 +1,383 @@
+---
+title: "Causal Effect Estimation (Obesity Paradox)"
+author: "Causal Inference for Health Data - Vignette I"
+output:
+  html_document:
+    logo: img/cihd-logo.png
+    theme: cosmo
+    highlight: tango
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    mathjax: default
+    df_print: paged
+    number_sections: true
+---
+
+<style>
+#TOC { top: 120px}
+.header-logo { position: absolute; top: 26px; right: 40px; z-index: 1000; }
+.header-logo img { height: 120px; }
+@media (max-width: 992px) {
+  #TOC { left: auto; right: auto; top: auto; max-width: none; }
+  .header-logo { position: static; margin-top: 10px; }
+}
+</style>
+
+<div class="header-logo">
+  <img src="../img/cihd-logo.png" alt="CIHD logo">
+</div>
+
+```{r setup, include=FALSE}
+root <- rprojroot::find_root(rprojroot::has_dir(".git"))
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+knitr::opts_knit$set(root.dir = root)
+knitr::opts_chunk$set(fig.path = file.path(root, "vignettes/estimation_files/figure-html/"))
+Sys.setenv("RICU_CONFIG_PATH" = file.path(root, "config"))
+source(file.path(root, "r/callbacks.R"))
+source(file.path(root, "r/helpers.R"))
+source(file.path(root, "r/op-helpers.R"))
+library(data.table)
+library(xgboost)
+library(ricu)
+set.seed(2026)
+
+clip01 <- function(p, eps = 1e-3) pmin(pmax(p, eps), 1 - eps)
+```
+
+### Data Loading
+
+In this vignette, we will study the obesity paradox, an epidemiological phenomenon
+observed in ICU populations. Our treatment of interest is whether the patient
+is overweight or obese ($X = 1$ for increased BMI), and the outcome of interest
+is in-hospital mortality after ICU admission ($Y$). We start with the data
+loading.
+
+```{r data}
+load_op_data <- function(src) {
+  
+  # load the BMI data
+  bmi_var <- if (src == "miiv") "bmi_omr" else "bmi"
+  dat <- load_concepts(bmi_var, src)
+  dat <- dat[get(bmi_var) > 18.5]
+  
+  # get the confounders: 
+  dat <- merge(dat, load_concepts(c("sex", "charlson", "age"), src))
+  dat[, sex := as.integer(sex == "Male")]
+  
+  # add SOFA
+  sf <- load_concepts("sofa", src, explicit_wins = hours(12L))
+  sf[, c(index_var(sf)) := NULL]
+  dat <- merge(dat, sf, all.x = TRUE)
+  
+  # Y is mortality
+  dod <- load_concepts("death", src)
+  dod <- dod[, c(id_vars(dod), "death"), with=FALSE]
+  dod[, death := as.integer(death)]
+  dat <- merge(dat, dod, all.x = TRUE)
+  
+  # impute the missing values
+  dat[is.na(sofa), sofa := 0]
+  dat[is.na(charlson), charlson := 0]
+  dat[is.na(age), age := 65]
+  dat[is.na(death), death := 0]
+  
+  dat[, c(bmi_var) := as.integer(get(bmi_var) > 25)]
+  setnames(dat, bmi_var, "X_bmi")
+  setnames(dat, "death", "Y_death")
+  setnames(dat, "sofa", "Z_sofa")
+  setnames(dat, "age", "Z_age")
+  setnames(dat, "sex", "Z_sex")
+  setnames(dat, "charlson", "Z_charlson")
+  
+  dat[, c(meta_vars(dat)) := NULL]
+}
+
+src <- "miiv"
+dat <- load_op_data(src)
+
+X <- "X_bmi"
+Y <- "Y_death"
+head(dat)
+```
+
+### Statistical Association via TV
+
+We begin by computing the so-called TV measure, which is just the difference
+between marginal expectations for $X=0$ and $X=1$ groups
+\begin{align}
+\text{TV}_{x_0, x_1}(y) = \mathbb{E}[Y\mid X=1] - \mathbb{E}[Y\mid X=0].
+\end{align}
+
+```{r tv}
+x <- dat[[X]]
+y <- dat[[Y]]
+TV <- mean(y[x == 1]) - mean(y[x == 0])
+round(TV, 3)
+```
+
+What does the TV measure tell us?
+
+### Causal Modeling: What is the graph?
+
+For constructing the graph, we make the following assertions:
+
+- age, sex influence obesity and comorbidities,
+- obesity and Charlson index may have a common cause (unobserved),
+- obesity influences illness severity (measured by the SOFA score),
+- all of the variables may influence death.
+
+These observations lead us to the following graph:
+
+```{r graph, engine = 'tikz', echo=FALSE, fig.align='center', out.width="50%"}
+\begin{tikzpicture}[>=stealth]
+
+% Nodes (absolute positions)
+\node (ob)     at (0, 0)   {Obesity};
+\node (age)    at (2, 2.2)   {Age};
+\node (sex)    at (4, 2.2)   {Sex};
+
+\node (char)   at (3, 1)   {Charlson};
+\node (sofa)   at (3, -1)  {SOFA};
+
+\node (death)  at (6, 0)   {Death};
+
+% Edges
+\draw[<->, dashed] (age) edge[bend left=20] (sex);
+\draw[->] (age) -- (ob);
+\draw[->] (sex) -- (ob);
+
+\draw[->] (age) edge[bend right = 20] (sofa);
+\draw[->] (sex) edge[bend left = 20] (sofa);
+
+\draw[<->, dashed] (char) -- (ob);
+
+\draw[->] (age) -- (char);
+\draw[->] (sex) -- (char);
+
+\draw[->] (age) to[bend left=20] (death);
+\draw[->] (sex) to[bend left=10] (death);
+
+\draw[->] (char) -- (sofa);
+\draw[->] (char) to[bend left=10] (death);
+
+\draw[->] (ob) -- (sofa);
+\draw[->] (sofa) -- (death);
+
+\draw[->] (ob) -- (death);
+
+\end{tikzpicture}
+```
+
+Question: how can we select a valid back-door adjustment set?
+
+```{r back-door-set}
+Z <- setdiff(names(dat), c(X, Y, "Z_sofa"))
+```
+
+## A: Inverse Propensity Weighing (IPW)
+
+The first set of methods we study are based on inverse-propensity weighing. The
+IPW estimator is given by:
+
+\begin{align}
+\widehat{ATE}_{\mathrm{IPW}} = \frac{1}{n}\sum_i\left(\frac{X_i Y_i}{\widehat{\pi} (Z_i)} - \frac{(1-X_i)Y_i}{1-\widehat{\pi} (Z_i)}\right),\quad \widehat{\pi} (z)=P(X=1\mid Z=z)
+\end{align}
+
+```{r ipw}
+cv_xgb <- function(df, y, weights = NULL, ...) {
+  
+  dtrain <- xgb.DMatrix(data = as.matrix(df), label = y, weight = weights)
+  params <- list(objective = "binary:logistic", eval_metric = "logloss")
+  
+  cv <- xgb.cv(
+    params = params,
+    data = dtrain,
+    nrounds = 1000,
+    nfold = 5,
+    early_stopping_rounds = 10,
+    verbose = FALSE,
+    ...
+  )
+  
+  mod <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = cv$best_iteration,
+    verbose = FALSE,
+    ...
+  )
+  
+  mod
+}
+
+pred_xgb <- function(mod, df_test, do_x = NULL, X = "X") {
+  if (!is.null(do_x)) df_test[[X]] <- do_x
+  predict(mod, as.matrix(df_test))
+}
+
+z <- dat[, ..Z]
+xgb_x_z <- cv_xgb(z, x)
+pi <- clip01(pred_xgb(xgb_x_z, z))
+
+ATE_ipw <- mean(x * y / pi - (1 - x) * y / (1 - pi))
+
+ATE_ipw_boot <- c()
+for (b in seq_len(500)) {
+  b_idx <- sample.int(length(y), replace = TRUE)
+  ATE_ipw_boot <- c(
+    ATE_ipw_boot,
+    mean(x[b_idx] * y[b_idx] / pi[b_idx] - (1 - x[b_idx]) * y[b_idx] / (1 - pi[b_idx]))
+  )
+}
+
+ci_ipw <- c(
+  2 * ATE_ipw - quantile(ATE_ipw_boot, prob = 0.975),
+  2 * ATE_ipw - quantile(ATE_ipw_boot, prob = 0.025)
+)
+
+cat(round(ATE_ipw, 3), "[", round(ci_ipw[1], 3), ",", round(ci_ipw[2], 3), "]")
+```
+
+Question: how can the bootstrap step above be improved?
+
+Question: how do we investigate the positivity assumption?
+
+## B: Outcome regression
+
+The second approach for effect estimation we study is based on regression. 
+
+### XGBoost Regression Estimate
+
+We first perform regression using `xgboost`, and then extract the effect estimates.
+
+```{r or-xgb}
+xgb_y_xz <- cv_xgb(data.table(x = x, z), y)
+mu1 <- pred_xgb(xgb_y_xz, data.table(x = x, z), do_x = 1, X = "x")
+mu0 <- pred_xgb(xgb_y_xz, data.table(x = x, z), do_x = 0, X = "x")
+
+ATE_xgb <- mean(mu1 - mu0)
+
+ATE_xgb_boot <- c()
+for (b in seq_len(500)) {
+  b_idx <- sample.int(length(mu1), replace = TRUE)
+  ATE_xgb_boot <- c(ATE_xgb_boot, mean(mu1[b_idx] - mu0[b_idx]))
+}
+
+ci_xgb <- c(
+  2 * ATE_xgb - quantile(ATE_xgb_boot, prob = 0.975),
+  2 * ATE_xgb - quantile(ATE_xgb_boot, prob = 0.025)
+)
+
+cat(round(ATE_xgb, 3), "[", round(ci_xgb[1], 3), ",", round(ci_xgb[2], 3), "]")
+```
+
+### Logistic GLM Regression Estimate
+
+We perform a similar approach, but this time with a binomial GLM.
+
+```{r or-glm}
+fit <- glm(reformulate(c(X, Z), response = Y), data = dat, family = binomial())
+
+p1 <- predict(fit, newdata = copy(dat)[, (X) := 1], type = "response")
+p0 <- predict(fit, newdata = copy(dat)[, (X) := 0], type = "response")
+
+ATE_glm <- mean(p1 - p0)
+
+ATE_glm_boot <- c()
+for (b in seq_len(500)) {
+  b_idx <- sample.int(nrow(dat), replace = TRUE)
+  ATE_glm_boot <- c(ATE_glm_boot, mean(p1[b_idx] - p0[b_idx]))
+}
+
+ci_glm <- c(
+  2 * ATE_glm - quantile(ATE_glm_boot, prob = 0.975),
+  2 * ATE_glm - quantile(ATE_glm_boot, prob = 0.025)
+)
+
+cat(round(ATE_glm, 3), "[", round(ci_glm[1], 3), ",", round(ci_glm[2], 3), "]")
+```
+
+Question: why can the effect estimates be different? What kind of assumptions does
+GLM make?
+
+## C: Augmented Inverse Propensity Weighing (AIPW)
+
+The third approach we study is based on augmented inverse propensity weighing.
+This is approach is sometimes referred to as doubly-robust estimation.
+
+```{r aipw}
+# nuisance fits already available from regresion, IPW
+
+ATE_aipw <- mean(mu1 - mu0 + x * (y - mu1) / pi - (1 - x) * (y - mu0) / (1 - pi))
+
+ATE_aipw_boot <- c()
+for (b in seq_len(500)) {
+  b_idx <- sample.int(length(y), replace = TRUE)
+  ATE_aipw_boot <- c(
+    ATE_aipw_boot,
+    mean(
+      (mu1[b_idx] - mu0[b_idx]) +
+        x[b_idx] * (y[b_idx] - mu1[b_idx]) / pi[b_idx] -
+        (1 - x[b_idx]) * (y[b_idx] - mu0[b_idx]) / (1 - pi[b_idx])
+    )
+  )
+}
+
+ci_aipw <- c(
+  2 * ATE_aipw - quantile(ATE_aipw_boot, prob = 0.975),
+  2 * ATE_aipw - quantile(ATE_aipw_boot, prob = 0.025)
+)
+
+cat(round(ATE_aipw, 3), "[", round(ci_aipw[1], 3), ",", round(ci_aipw[2], 3), "]")
+```
+
+Question: what are the key benefits of this approach?
+
+## D: Cross-Fitted AIPW (DML)
+
+The last approach we study is based on augmented inverse propensity weighing,
+but also uses a so-called cross-fitting step.
+This is approach is sometimes referred to as doubly machine learning (DML).
+
+```{r dml}
+cf_aipw <- function(d, X, Y, Z, K = 5) {
+  n <- nrow(d)
+  fld <- sample(rep(seq_len(K), length.out = n))
+  sc <- rep(NA_real_, n)
+  for (k in seq_len(K)) {
+    tst <- fld == k
+    trn <- !tst
+
+    x_trn <- d[[X]][trn]
+    y_trn <- d[[Y]][trn]
+    z_trn <- d[trn, ..Z]
+
+    mod_pi <- cv_xgb(z_trn, x_trn)
+    pi_tst <- clip01(pred_xgb(mod_pi, d[tst, ..Z]))
+
+    mod_mu <- cv_xgb(data.table(x = x_trn, z_trn), y_trn)
+    mu1_tst <- pred_xgb(mod_mu, data.table(x = d[[X]][tst], d[tst, ..Z]), do_x = 1, X = "x")
+    mu0_tst <- pred_xgb(mod_mu, data.table(x = d[[X]][tst], d[tst, ..Z]), do_x = 0, X = "x")
+
+    x_tst <- d[[X]][tst]
+    y_tst <- d[[Y]][tst]
+    sc[tst] <- 
+      (mu1_tst - mu0_tst) + x_tst * (y_tst - mu1_tst) / pi_tst - 
+      (1 - x_tst) * (y_tst - mu0_tst) / (1 - pi_tst)
+  }
+  list(
+    ate = mean(sc),
+    sd = sqrt(var(sc) / n),
+    sc = sc
+  )
+}
+
+dml <- cf_aipw(dat, X, Y, Z, K = 5)
+ci_dml <- c(dml$ate - 1.96 * dml$sd, dml$ate + 1.96 * dml$sd)
+cat(round(dml$ate, 3), "[", round(ci_dml[1], 3), ",", round(ci_dml[2], 3), "]")
+```
+
+Question: what are the benefits of DML? Do we need to perform bootstrap?

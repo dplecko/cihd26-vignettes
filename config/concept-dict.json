@@ -1,0 +1,307 @@
+{
+  "o2flow": {
+    "sources": {
+      "miiv": [
+        {
+          "table": "chartevents",
+          "sub_var": "itemid",
+          "ids": [223834]
+        }
+      ]
+    }
+  },
+  "o2device": {
+    "sources": {
+      "miiv": [
+        {
+          "table": "chartevents",
+          "sub_var": "itemid",
+          "val_var": "value",
+          "ids": [226732]
+        }
+      ]
+    }
+  },
+  "oxy_ind": {
+    "concepts": [
+      "fio2",
+      "o2flow",
+      "o2device"
+    ],
+    "callback": "oxygen_miiv_cb",
+    "class": "rec_cncpt",
+    "target": "ts_tbl"
+  },
+  "oxy_imp": {
+    "concepts": [
+      "oxy_ind"
+    ],
+    "callback": "oxygen_impute_miiv_cb",
+    "class": "rec_cncpt",
+    "target": "ts_tbl"
+  },
+  "lact_24": {
+    "concepts": ["lact"],
+    "description": "Worst lactate in 24 hours",
+    "callback": "lact_dayone",
+    "class": "rec_cncpt",
+    "target": "id_tbl"
+  },
+  "ast_24": {
+    "concepts": ["ast"],
+    "description": "Worst AST in 24 hours",
+    "callback": "ast_dayone",
+    "class": "rec_cncpt",
+    "target": "id_tbl"
+  },
+  "safi_24": {
+    "concepts": ["safi"],
+    "description": "Worst SaO2/FiO2 in 24 hours",
+    "callback": "safi_dayone",
+    "class": "rec_cncpt",
+    "target": "id_tbl"
+  },
+  "pafi_24": {
+    "concepts": ["pafi"],
+    "description": "Worst PaO2/FiO2 in 24 hours",
+    "callback": "pafi_dayone",
+    "class": "rec_cncpt",
+    "target": "id_tbl"
+  },
+  "acu_24": {
+    "concepts": ["sofa"],
+    "description": "SOFA at 24 hours",
+    "callback": "acute_dayone",
+    "class": "rec_cncpt",
+    "target": "id_tbl"
+  },
+  "diag": {
+    "target": "id_tbl",
+    "levels": ["CMED", "CSURG", "DENT", "ENT", "GU", "GYN", "MED", "NB", "NBB", "NMED", "NSURG", "OBS", "ORTHO", "OMED", "PSURG", "PSYCH", "SURG", "TRAUM", "TSURG", "VSURG"],
+    "class": "fct_cncpt",
+    "description": "patient admission type",
+    "category": "demographics",
+    "sources": {
+      "miiv": [
+        {
+          "table": "services",
+          "val_var": "curr_service",
+          "class": "col_itm"
+        }
+      ],
+      "mimic_demo": [
+        {
+          "table": "services",
+          "val_var": "curr_service",
+          "callback": "mimic_adm_diag",
+          "class": "col_itm"
+        }
+      ]
+    }
+  },
+  "race": {
+    "description": "Race",
+    "category": "Misc.",
+    "levels": ["Caucasian", "Asian", "African American", "Hispanic", "Other"],
+    "class": "fct_cncpt",
+    "target": "id_tbl",
+    "sources": {
+      "mimic_demo": [
+        {
+          "table": "admissions",
+          "val_var": "ethnicity",
+          "class": "col_itm",
+          "callback": "race_mim_callback"
+        }
+      ],
+      "miiv": [
+        {
+          "table": "admissions",
+          "val_var": "race",
+          "class": "col_itm",
+          "callback": "race_miiv_callback"
+        }
+      ]
+    }
+  },
+  "adm_episode": {
+    "target": "id_tbl",
+    "sources": {
+      "miiv": [
+        {
+          "table": "icustays",
+          "val_var": "subject_id",
+          "class": "col_itm",
+          "callback": "miiv_adm_epi_cb"
+        }
+      ],
+      "mimic_demo": [
+        {
+          "table": "icustays",
+          "val_var": "subject_id",
+          "class": "col_itm",
+          "callback": "mimic_adm_epi_cb"
+        }
+      ]
+    }
+  },
+  "charlson": {
+    "target": "id_tbl",
+    "sources": {
+      "miiv": [
+        {
+          "ids": [9, 10],
+          "table": "diagnoses_icd",
+          "val_var": "icd_code",
+          "sub_var": "icd_version",
+          "callback": "miiv_charlson_cb"
+        }
+      ]
+    }
+  },
+  "elixhauser": {
+    "target": "id_tbl",
+    "sources": {
+      "miiv": [
+        {
+          "ids": [9, 10],
+          "table": "diagnoses_icd",
+          "val_var": "icd_code",
+          "sub_var": "icd_version",
+          "callback": "miiv_elixhauser_cb"
+        }
+      ]
+    }
+  },
+  "elective": {
+    "target": "id_tbl",
+    "sources": {
+      "miiv": [
+        {
+          "table": "admissions",
+          "val_var": "admission_type",
+          "loc_var": "admission_location",
+          "class": "col_itm",
+          "callback": "miiv_elective"
+        }
+      ],
+      "mimic_demo": [
+        {
+          "table": "admissions",
+          "val_var": "admission_type",
+          "class": "col_itm",
+          "callback": "mimic_elective"
+        }
+      ]
+    }
+  },
+  "bmi_omr": {
+    "target": "id_tbl",
+    "sources": {
+      "miiv": [
+        {
+          "ids": ["BMI (kg/m2)"],
+          "table": "omr",
+          "sub_var": "result_name",
+          "callback": "miiv_omr_bmi_cb"
+        }
+      ]
+    }
+  },
+  "bmi_all": {
+    "concepts": ["bmi", "bmi_omr"],
+    "callback": "bmi_all_cb",
+    "class": "rec_cncpt",
+    "target": "id_tbl"
+  },
+  "elix_components": {
+    "concepts": ["sex"],
+    "callback": "miiv_elix_by",
+    "class": "rec_cncpt",
+    "target": "id_tbl"
+  },
+  "opioids": {
+    "target": "win_tbl",
+    "description": "Opioid Administration",
+    "class": "lgl_cncpt",
+    "sources": {
+      "mimic": [
+        {
+          "table": "inputevents_mv",
+          "sub_var": "itemid",
+          "ids": [221744, 221833, 227520, 225972, 225942, 225154, 225973],
+          "dur_var": "endtime"
+        },
+        {
+          "table": "inputevents_cv",
+          "sub_var": "itemid",
+          "ids": [30150, 30308, 30118, 30149, 43387, 30153, 30126, 44306, 46725, 45764, 30163, 42989],
+          "dur_var": "storetime",
+          "target": "ts_tbl",
+          "callback": "ts_to_win_12hours"
+        }
+      ]
+    }
+  },
+  "propofol": {
+    "target": "win_tbl",
+    "description": "Propofol Administration",
+    "class": "lgl_cncpt",
+    "sources": {
+      "mimic": [
+        {
+          "table": "inputevents_mv",
+          "sub_var": "itemid",
+          "ids": [222168],
+          "dur_var": "endtime"
+        },
+        {
+          "table": "inputevents_cv",
+          "sub_var": "itemid",
+          "ids": [30131],
+          "dur_var": "storetime",
+          "target": "ts_tbl",
+          "callback": "ts_to_win_12hours"
+        }
+      ]
+    }
+  },
+  "benzos": {
+    "target": "win_tbl",
+    "description": "Propofol Administration",
+    "class": "lgl_cncpt",
+    "sources": {
+      "mimic": [
+        {
+          "table": "inputevents_mv",
+          "sub_var": "itemid",
+          "ids": [221385, 221623, 221668],
+          "dur_var": "endtime"
+        },
+        {
+          "table": "inputevents_cv",
+          "sub_var": "itemid",
+          "ids": [30124, 45520, 30139],
+          "dur_var": "storetime",
+          "target": "ts_tbl",
+          "callback": "ts_to_win_12hours"
+        }
+      ]
+    }
+  },
+  "notes": {
+    "sources": {
+      "mimic": [
+        {
+          "table": "noteevents",
+          "val_var": "text",
+          "index2_var": "charttime",
+          "grp1_var": "category",
+          "grp2_var": "row_id",
+          "callback": "mimic_notes_cb",
+          "class": "col_itm"
+        }
+      ]
+    }
+  }
+}
