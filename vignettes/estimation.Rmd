@@ -3,7 +3,6 @@ title: "Causal Effect Estimation (Obesity Paradox)"
 author: "Causal Inference for Health Data - Vignette I"
 output:
   html_document:
-    logo: img/cihd-logo.png
     theme: cosmo
     highlight: tango
     toc: true
@@ -42,6 +41,7 @@ source(file.path(root, "r/op-helpers.R"))
 library(data.table)
 library(xgboost)
 library(ricu)
+library(ggplot2)
 set.seed(2026)
 
 clip01 <- function(p, eps = 1e-3) pmin(pmax(p, eps), 1 - eps)
@@ -254,9 +254,9 @@ The second approach for effect estimation we study is based on regression.
 We first perform regression using `xgboost`, and then extract the effect estimates.
 
 ```{r or-xgb}
-xgb_y_xz <- cv_xgb(data.table(x = x, z), y)
-mu1 <- pred_xgb(xgb_y_xz, data.table(x = x, z), do_x = 1, X = "x")
-mu0 <- pred_xgb(xgb_y_xz, data.table(x = x, z), do_x = 0, X = "x")
+xgb_y_xz <- cv_xgb(data.table(x = x, z), y) # Line 1
+mu1 <- pred_xgb(xgb_y_xz, data.table(x = x, z), do_x = 1, X = "x") # Line 2
+mu0 <- pred_xgb(xgb_y_xz, data.table(x = x, z), do_x = 0, X = "x") # Line 3
 
 ATE_xgb <- mean(mu1 - mu0)
 
@@ -311,7 +311,7 @@ This is approach is sometimes referred to as doubly-robust estimation.
 ```{r aipw}
 # nuisance fits already available from regresion, IPW
 
-ATE_aipw <- mean(mu1 - mu0 + x * (y - mu1) / pi - (1 - x) * (y - mu0) / (1 - pi))
+ATE_aipw <- mean(x * (y - mu1) / pi + mu1 - ((1 - x) * (y - mu0) / (1 - pi) + mu0))
 
 ATE_aipw_boot <- c()
 for (b in seq_len(500)) {

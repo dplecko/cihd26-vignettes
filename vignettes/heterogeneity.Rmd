@@ -1,0 +1,302 @@
+---
+title: "Heterogeneity in Oxygen Therapy in ICU"
+author: "Causal Inference for Health Data - Vignette II"
+output:
+  html_document:
+    theme: cosmo
+    highlight: tango
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    mathjax: default
+    df_print: paged
+    number_sections: true
+---
+
+<style>
+#TOC { top: 120px}
+.header-logo { position: absolute; top: 26px; right: 40px; z-index: 1000; }
+.header-logo img { height: 120px; }
+@media (max-width: 992px) {
+  #TOC { left: auto; right: auto; top: auto; max-width: none; }
+  .header-logo { position: static; margin-top: 10px; }
+}
+</style>
+
+<div class="header-logo">
+  <img src="../img/cihd-logo.png" alt="CIHD logo">
+</div>
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+root <- rprojroot::find_root(rprojroot::has_file(".gitignore"))
+Sys.setenv("RICU_CONFIG_PATH" = file.path(root, "config"))
+source(file.path(root, "r/callbacks.R"))
+source(file.path(root, "r/helpers.R"))
+library(ricu)
+library(ggplot2)
+library(data.table)
+library(grf)
+set.seed(2026)
+```
+
+## Data Loading
+
+We begin by loading the data from the MIMIC-IV dataset. The treatment of interest
+will be _mechanical ventilation_, and the outcome of interest will be the patient's
+oxygenation status measured by partial pressure of oxygen in arterial blood,
+_PaO2_.
+
+```{r var-setup}
+src <- "miiv" # MIMIC-IV dataset in ricu
+trt_var <- "oxy_imp" # indicator of supplemental oxygen
+out_var <- "po2" # partial pressure of oxygen in arterial blood
+```
+
+We load the time series data from MIMIC-IV using the `ricu` package.
+
+```{r load-impute}
+dat <- load_concepts(
+  c(trt_var, "resp", "po2", "pco2", "sofa", "o2sat", "sex", "age", "fio2"), src,
+  verbose = FALSE
+)
+
+# subset to first 2 days of ICU stay
+dat <- dat[get(index_var(dat)) <= hours(48L) &
+           get(index_var(dat)) >= hours(0L)]
+
+# if oxygen indicator indicator is missing, assume the patient is not ventilated
+dat[is.na(get(trt_var)), c(trt_var) := FALSE]
+
+# indicate time of first treatment onwards
+dat[, is_trt := cummax(get(trt_var)), by = c(id_vars(dat))]
+
+# carry forward imputation for vitals (O2 saturation, respiratoy rate)
+dat <- replace_na(dat, type = "locf", by = id_vars(dat),
+                  vars = c("o2sat", "resp"))
+
+# impute values in the normal range for missing entries
+imp_vals <- list(resp = 18, o2sat = 99, sofa = 0)
+for (var in names(imp_vals)) {
+  dat[is.na(get(var)), c(var) := imp_vals[[var]]] 
+}
+```
+
+## Selecting Cohort & Generating Data
+
+Selecting all patients with PaO2 reading below 90, before oxygen therapy is
+initiated.
+
+```{r cohort}
+# select all patients with PaO2 reading below 90 before oxygen is given
+cand <- unique(id_col(dat[po2 < 90 & is_trt == 0]))
+# subset data to this candidate cohort
+cdat <- dat[id_col(dat) %in% cand]
+```
+
+Create lag-variables, used for data-processing later.
+
+```{r vent-period}
+# lag treatment by 3 hours each way (used for pre- and post- treatment windows)
+cdat[, is_trt_lag3 := data.table::shift(is_trt, -3L), by = c(id_vars(cdat))]
+cdat[, is_trt_lagrev3 := data.table::shift(is_trt, 3L), by = c(id_vars(cdat))]
+
+# lag treatment by 12 hours (used for controls)
+cdat[, is_trt_lag12 := data.table::shift(is_trt, -12L), by = c(id_vars(cdat))]
+```
+
+Specify how to perform data aggregation prior to treatment.
+```{r data-agg}
+# deciding how to aggregate data in 
+j_expr <- quote(list(
+  pco2    = mean_or_na(pco2),
+  o2sat   = mean_or_na(o2sat),
+  sofa    = max_or_na(sofa),
+  resp    = mean_or_na(resp),
+  po2     = mean_or_na(po2),
+  sex     = unique(sex),
+  age     = unique(age)
+))
+```
+
+Creating the treated cohort.
+
+```{r treated-coh}
+# treated cohort: PaO2 < 90, and oxygen therapy within 3 hours
+trt_coh <- unique(id_col(cdat[is_trt_lag3 == 1 & po2 < 90 & is_trt == 0]))
+tdat <- cdat[get(id_var(cdat)) %in% trt_coh]
+
+# for each patient, get PaO2 readings after oxygen therapy is started
+post_trt <- tdat[!is.na(po2) & is_trt == 1][, c(id_vars(cdat), out_var), with=FALSE]
+
+# take only the first PaO2 reading after treatment started
+post_trt <- post_trt[, head(.SD, n=1L), by = c(id_vars(cdat))]
+post_trt <- setnames(post_trt, out_var, "out_post")
+
+trt_dat <- merge(
+  # aggregate values 3 hours prior to treatment
+  tdat[is_trt == 0 & is_trt_lag3 == 1, eval(j_expr), by = c(id_vars(dat))],
+  post_trt
+)
+
+# indicate these are the treated cases
+trt_dat[, treat := 1]
+```
+
+Creating the untreated cohort.
+
+```{r control-coh}
+# untreated cohort: treatment not given within 12 hours of PaO2 < 90
+ctrls <- cdat[is_trt_lag12 == 0 & po2 < 90 & is_trt == 0]
+
+# of possible times where treatment could have been given, pick one at random 
+ctrls[, sel_row := sample(.N, 1), by = c(id_vars(ctrls))]
+ntrt <- ctrls[, list(charttime=charttime[unique(sel_row)]), by = c(id_vars(ctrls))]
+# set the time of non-treament to 1 hour after PaO2 < 90 observed
+ntrt[, c(index_var(ntrt)) := get(index_var(ntrt)) + 1]
+# indicate that non-treatment starts at this time
+ntrt[, non_trt := 1]
+
+# get all time-series data for control cases 
+ndat <- cdat[(id_col(cdat) %in% id_col(ctrls))]
+
+# merge in control times, where treatment was not given
+ndat <- merge(ndat, ntrt, all.x=TRUE)
+# for all other times, control was not initiated
+ndat[is.na(non_trt), non_trt := 0]
+
+# obtain a cumulative indicator - whether treatment was given previously
+ndat[, non_trt := cummax(non_trt), by = c(id_vars(dat))]
+
+# create 3-hour lag for control time
+ndat[, is_ntrt_lag3 := data.table::shift(non_trt, -3L), by = c(id_vars(ndat))]
+
+# get all PaO2 measurements after control time
+post_ctrl <- ndat[!is.na(po2) & non_trt == 1][, c(id_vars(cdat), out_var), with=FALSE]
+# select first PaO2 measurement after control time
+post_ctrl <- post_ctrl[, head(.SD, n=1L), by = c(id_vars(post_ctrl))]
+post_ctrl <- setnames(post_ctrl, out_var, "out_post")
+
+untrt_dat <- merge(
+  # average values in 3 hours prior to control time
+  ndat[non_trt == 0 & is_ntrt_lag3 == 1, eval(j_expr), by = c(id_vars(dat))],
+  post_ctrl
+)
+
+# indicate that these are control cases
+untrt_dat <- untrt_dat[, treat := 0]
+```
+
+Combining the treated and untreated into a single `data.table`.
+
+```{r coh-gen}
+res <- rbind(trt_dat, untrt_dat)
+res[, sex := ifelse(sex == "Male", 1, 0)]
+head(res)
+```
+
+## Inspecting Heterogeneity
+
+We fit a causal forest to estimate heterogenous effects.
+
+```{r crf}
+# fit the causal forest
+crf <- causal_forest(
+  X = as.matrix(res[, c("pco2", "o2sat", "resp", "po2", "sofa", "sex", "age"), 
+                    with=FALSE]), # all covariates -- pre-treatment!
+  Y = as.numeric(res$out_post), # outcome variable
+  W = res$treat # treatment variable
+)
+
+# get conditional treatment effects (z-TE) for each row
+res[, cate := crf$predictions]
+```
+
+### TE Measure
+
+We first compute the total effect, which is just the mean of all z-specific effects
+
+$$
+\hat{\text{TE}}_{x_0, x_1}(y) = \frac{1}{n} \sum_{i=1}^n \hat{z\text{-TE}}_{x_0, x_1}(y\mid z_i)
+$$
+
+```{r te}
+res[, mean(cate)]
+```
+
+The treatment increases PaO2 by `r `round(res[, mean(cate), 1)` on average.
+
+### ETT
+
+We next look at the effect of treatment on the treated (ETT). We first compare
+the treated and untreated populations.
+
+#### Comparing the treated and untreated groups
+
+```{r compare-age, fig.align='center'}
+# compare the age distribution - what is the conclusion?
+ggplot(res, aes(x = age, color = factor(treat))) +
+  stat_ecdf() + theme_bw() + 
+  scale_color_discrete(name = "Treatment", labels = c("no", "yes"))
+```
+
+We conclude that patients that are treated are _older_ on average.
+
+```{r compare-sofa, fig.align='center'}
+# compare the SOFA score distribution - what is the conclusion?
+ggplot(res, aes(x = sofa, color = factor(treat))) +
+  stat_ecdf() + theme_bw() + 
+  scale_color_discrete(name = "Treatment", labels = c("no", "yes"))
+```
+
+We conclude that patients that are treated have _lower_ SOFA scores on average.
+
+#### ETT computation
+
+Provided the set of covariates $Z$ is back-door for $(X, Y)$, the ETT can be
+computed as:
+
+$$
+\hat{\text{ETT}}_{x_0, x_1}(y \mid x) = \frac{1}{n} \sum_{i: X_i=x} \hat{z\text{-TE}}_{x_0, x_1}(y\mid z_i)
+$$
+
+```{r ett}
+etts <- res[, list(ett = mean(cate)), by = "treat"]
+etts
+```
+
+For the treated, PaO2 increases by `r round(etts$ett[2], 1)` following treatment.
+For the unreated, PaO2 increases by `r round(etts$ett[1], 1)` following treatment.
+
+We next look at conditional effects to better understand this difference.
+
+### z-TE(s)
+
+Inspecting heterogeneity according to SOFA.
+```{r sofa-te, fig.align='center', warning=FALSE}
+sofa_te <- res[, list(zte = mean(cate), dev = sd(cate) / sqrt(.N), cnt = .N), 
+               by = c("sofa")]
+
+ggplot(sofa_te[cnt > 10], aes(x = sofa, y = zte)) + 
+  geom_point() + theme_bw() + theme_bw() + geom_line() +
+  geom_ribbon(aes(ymin=zte - 1.96 * dev, ymax = zte + 1.96 * dev), alpha = 0.3)
+```
+
+```{r age-te, fig.align='center', warning=FALSE}
+decile_heterogeneity <- function(var, res) {
+  
+  res[, dec := .bincode(get(var), quantile(get(var), seq(0, 1, 0.1)))]
+  z_te <- res[, list(zte = mean(cate), dev = sd(cate) / sqrt(.N), cnt = .N), 
+              by = c("dec")]
+  ggplot(z_te, aes(x = dec, y = zte)) +
+    geom_point() + theme_bw() + geom_line() +
+    geom_ribbon(aes(ymin=zte - 1.96 * dev, ymax = zte + 1.96 * dev), alpha = 0.3)
+}
+
+decile_heterogeneity("age", res)
+```
+
+How do we explain this heterogeneity? Provide two reasons.
