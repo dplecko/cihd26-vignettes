@@ -1,0 +1,299 @@
+---
+title: "Hospitality Mortality after ICU Admission"
+author: "Causal Inference for Health Data - Vignete III"
+output:
+  html_document:
+    theme: cosmo
+    highlight: tango
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    mathjax: default
+    df_print: paged
+    number_sections: true
+---
+
+<style>
+#TOC { top: 120px}
+.header-logo { position: absolute; top: 26px; right: 40px; z-index: 1000; }
+.header-logo img { height: 64px; }
+@media (max-width: 992px) {
+  #TOC { left: auto; right: auto; top: auto; max-width: none; }
+  .header-logo { position: static; margin-top: 10px; }
+}
+</style>
+
+```{r setup, include=FALSE}
+root <- rprojroot::find_root(rprojroot::has_file(".gitignore"))
+knitr::opts_knit$set(root.dir = root)
+Sys.setenv("RICU_CONFIG_PATH" = file.path(root, "config"))
+source(file.path(root, "r/callbacks.R"))
+source(file.path(root, "r/helpers.R"))
+
+library(ricu)
+library(ggplot2)
+library(data.table)
+library(faircause)
+library(xgboost)
+set.seed(2026)
+```
+
+### Inspecting the Data from MIMIC-IV dataset
+
+We begin by loading and inspecting the required data from MIMIC-IV:
+
+```{r icu-mortality-inspect}
+# load information about ICU admission episode
+adm_info <- load_concepts("adm_episode", "miiv", verbose = FALSE)
+# subset to only first admission episode
+patient_ids <- id_col(adm_info[adm_episode == 1])
+
+# load relevant concepts for investigating mortality
+dat <- load_concepts(c("acu_24", "diag", "age", "sex", "charlson",
+                       "lact_24", "pafi_24", "ast_24",
+                       "race", "death"), "miiv", patient_ids = patient_ids,
+                     verbose = FALSE)
+
+# compare only White and African-American patients
+dat <- dat[race %in% c("Caucasian", "African American")]
+dat[, majority := as.integer(race == "Caucasian")]
+dat[, race := NULL]
+
+# remove time variable
+dat[, c(index_var(dat)) := NULL]
+
+# impute normal/median values for missing covariates
+imp_lst <- list(
+  age = 65,
+  acu_24 = 0,
+  charlson = 0,
+  lact_24 = 1,
+  ast_24 = 20,
+  pafi_24 = 500,
+  death = FALSE
+)
+
+for (i in seq_len(ncol(dat))) {
+
+  var <- names(dat)[i]
+  if (any(is.na(dat[[var]])) & !is.null(imp_lst[[var]]))
+    dat[is.na(get(var)), c(var) := imp_lst[[var]]]
+}
+
+# visualize the data
+knitr::kable(head(dat), caption = "MIMIC-IV Mortality data.")
+```
+
+We consider the cohort of all patients in the database admitted to the ICU (and we only consider the first admission of each patient). We load information on the SOFA score, admission diagnosis, age, sex, Charlson comorbidity index, worst values of lactate, PaO2/FiO2, and AST in the first 24 hours of ICU stay. 
+We further load the race information (protected attribute $X$) and the death indicator (outcome $Y$). We want to investigate the disparities in outcome between `"Caucasian"` and `"African American"` groups.
+
+### Constructing the Graphical Model
+
+We next construct the mapping of the covariates to our graphical model. 
+
+```{r construct-sfm}
+# constructing the causal diagram
+X <- "majority" # protected attribute, "treatment"
+Z <- c("age") # confounding variable
+# mediators: SOFA, admission diagnosis, Charlson index, lactate, PaO2/FiO2, AST
+W <- c("acu_24", "diag", "charlson", "lact_24", "pafi_24", "ast_24")
+Y <- "death" # outcome variable
+```
+
+### Decomposing the Disparity
+
+We use the `faircause` R-package, which performs the decomposition of the TV
+measure into direct, indirect, and spurious components.
+
+```{r decompose-difference, warning=FALSE}
+fcb <- fairness_cookbook(data = dat, X = X, Z = Z, W = W, Y = Y, x0 = 0, x1 = 1)
+```
+
+We can then inspect the decomposition by calling `autoplot()` on the `fcb` object which is an S3 class of type `faircause`:
+
+```{r autoplot, fig.align='center', message=FALSE, fig.width=8, fig.height=5}
+autoplot(fcb) +
+  labs(title="Causal decomposition of mortality difference: MIMIC-IV race effect",
+       y="Mortality difference (%)") +
+  theme_minimal() +
+  scale_x_discrete(labels = c("Total Variation", "Direct", "Indirect",
+                                "Confounded"), name = "Pathway") +
+  scale_fill_discrete(labels = c("Total Variation", "Direct", "Indirect",
+                                 "Confounded"), name = "Pathway")
+```
+
+### Understanding the Decomposition
+
+We now analyze each of the spurious, indirect, and direct effects, to better
+understand what drives them.
+
+#### Zooming-in on the Spurious Effect
+
+To better understand the spurious effect, we plot the density of the age distributions between groups:
+
+```{r, echo=FALSE, fig.align='center', fig.width=7, fig.height=4}
+# investigate the age data
+age_dat <- load_concepts(c("age", "race"), "miiv", 
+                         patient_ids = patient_ids,
+                         verbose=FALSE)
+ggplot(age_dat[race %in% c("Caucasian", "African American")],
+       aes(x = age, fill = race)) +
+  geom_density(alpha = 0.4) +
+  scale_fill_discrete(name = "Race") +
+  theme_minimal()
+ 
+# ggsave("icu-mortality.png", width = 7, height = 4, bg = "white", dpi = 500)
+```
+
+#### Zooming-in on the Indirect Effect
+
+For the indirect effect, we want to inspect the distribution of the mediators
+`W`. Here, we will specifically focus on the Charlson comorbidity index, and the
+admission diagnosis. However, we must be careful when using a visualization:
+the TV decomposition tells us that minority patients are likely more sick along
+the indirect effect; but if we simply look at the conditional distribution
+$P(W \mid X = x)$, we have not adjusted for the effect of _age_, which we know
+is important since we saw previously that minority patients are _younger on
+average_, and age is known to affect illness severity and/or pre-morbid health
+status. To resolve this issue, we need to make sure our visualizations adjust
+for the effect of age. We write a function called `mc_age_adjust()`:
+
+```{r monte-carlo-age}
+mc_age_adjust <- function(dat, n_mc = list(10^5, 10^5)) {
+  
+  dat[, age := round(age)]
+  
+  # pre-compute age look-ups
+  lookup <- replicate(17, NULL)
+  for (i in seq(range(dat$age)[1], range(dat$age)[2])) {
+    
+    lookup[[i]] <- list(NULL)
+    lookup[[i]][[1]] <- which(dat$age == i & dat$majority == 0)
+    lookup[[i]][[2]] <- which(dat$age == i & dat$majority == 1)
+  }
+  
+  if (max(dat$age) == 100) {
+    
+    if (length(lookup[[100]][[1]]) == 0) 
+      lookup[[100]][[1]] <- lookup[[99]][[1]]
+    
+    if (length(lookup[[98]][[1]]) == 0) 
+      lookup[[98]][[1]] <- lookup[[99]][[1]]
+  }
+  
+  ret <- c()
+  for (maj in c(0, 1)) {
+    
+    # sample age distribution
+    if (maj == 0 || n_mc[[1]] != n_mc[[2]])
+      ag <- sample(dat$age, n_mc[[maj + 1]], replace = TRUE)
+    
+    rows <- lapply(
+      unique(ag),
+      function(agi) {
+        
+        n_samp <- sum(ag == agi)
+        sample(x = lookup[[agi]][[maj + 1]], n_samp, replace = TRUE)
+      }
+    )
+    
+    ret <- if (maj == 0) dat[do.call(c, rows)] else rbind(ret, dat[do.call(c, rows)])
+  }
+  
+  ret
+}
+
+adj_dat <- mc_age_adjust(dat)
+```
+
+Using the adjusted data, we quantify the difference in CCI
+
+```{r cci-diff, fig.align='center'}
+ggplot(adj_dat, aes(x = charlson, fill = factor(majority))) +
+  geom_histogram(position = "identity", alpha = 0.5, color = "black") +
+  scale_fill_discrete(name = "Majority") +
+  theme_minimal()
+```
+
+After adjusting for age, minority patients have higher Charlson comorbidity indices.
+We further investigate the proportion of _medical admissions_ in each group, since
+medical admissions are associated with a much higher mortality rate:
+
+```{r adm-diff}
+adj_dat[, med_adm := diag %in% c("CMED", "MED", "NMED", "OMED")]
+adj_dat[, list(prop_med = mean(med_adm)), by = "majority"]
+```
+Minority patients are far more likely to be admitted for a medical reason (76\%)
+compared to majority patients (60\%), further explaining the indirect effect.
+
+#### Zooming-in on the Direct Effect
+
+The direct effect shows _better survival of minority patients_ after adjusting
+for both the confounders and the mediators. This is an unexpected finding, since
+usually unobserved covariates would show that minority patients are worse-off (e.g.,
+think of socioeconomic status). However, in our case, the sign is opposite. 
+
+To investigate this further, we analyze the heterogeneity of the direct effect
+along age and admission groups. For this, 
+
+```{r heterogeneity, fig.align='center'}
+dat <- merge(dat, load_concepts("elective", "miiv", verbose=FALSE), all.x = TRUE)
+diag_dt <- data.table(
+  diag_index = 0:17, 
+  diag = c("MED", "CMED", "NMED", "OMED", "PSYCH", "GU", "TRAUM", 
+           "ENT", "CSURG", "NSURG", "ORTHO", "PSURG", "SURG", 
+           "TSURG", "VSURG", "GYN", "OBS", "DENT")
+)
+dat <- merge(dat, diag_dt,by = "diag")
+
+# split elective and non-elective surgeries
+dat[diag_index >= 5, diag_index := diag_index + 20 * elective]
+
+W_cnd <- c(setdiff(W, "diag"), "diag_index", "elective")
+
+source("r/cnd-effects.R")
+source("r/one-step-debiased.R")
+
+cndE_obj <- cnd_effect(dat, X = X, Z = Z, W = W_cnd, Y = Y, method = "osd")
+sel_covs <- c("diag_grp", "age")
+E_lst <- cmbn_E(sel_covs, "miiv")
+cde <- infer(cndE_obj, E_lst)
+plt_E_cnd(cde, sel_covs, "DE Heterogeneity")
+```
+
+We can see that the direct effect is heterogeneous; modified by age, and likely
+by type of admission. In several places, however, the confidence intervals are
+wide, and we cannot establish the effect sign with certainty.
+
+#### Possible Explanation of the Direct Effect
+
+We investigate further, and look at the same effect estimates on the ANZICS database, which has millions of admissions. We plot the same effect heterogeneity (LHS):
+
+```{r, out.width="50%", fig.show="hold"}
+knitr::include_graphics(c(
+  file.path(root, "img/aics-de-hetero.png"),
+  file.path(root, "img/age-diag-risks.png")
+))
+```
+
+<!-- <div style="display: flex; gap: 20px;"> -->
+<!--   <div style="flex: 1;"> -->
+<!--     <img src="../img/aics-de-hetero.png" alt="Heterogeneity of DE on ANZICS" style="width: 100%;"> -->
+<!--   </div> -->
+<!--   <div style="flex: 1;"> -->
+<!--     <img src="../img/age-diag-risks.png" alt="Baseline Risk Ratio of ICU Admission in Australia" style="width: 100%;"> -->
+<!--   </div> -->
+<!-- </div> -->
+
+The pattern appears more clearly with larger sample size: the protective effect
+for the minority group is clustered around younger patients, and specifically for
+medical admissions.
+
+So how could such an effect be explained? To connect this effect, we plot the
+_baseline risk ratio of ICU admission_. Our hypothesis can be described as follows:
+minority patients are more likely to be admitted in the first place, 
+As the above plot (RHS) shows, the pattern across age groups and admission groups
+correlates very strongly: increased risk of admission for minority compared to
+majority patients is correlated with the direct effect!
